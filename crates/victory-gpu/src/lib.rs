@@ -42,6 +42,7 @@ mod book;
 #[cfg(windows)]
 mod heap_marks;
 #[cfg(windows)]
+mod guide;
 mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
@@ -54,6 +55,8 @@ mod inplace;
 mod port;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod livery;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -81,6 +84,10 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+#[cfg(windows)]
+mod raycounts;
+#[cfg(windows)]
+mod shading;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

@@ -151,6 +151,11 @@ thread_local! {
     /// and whether a view its shaders read is of that same texture.
     static TESTED_DEPTH: std::cell::Cell<(usize, bool)> =
         const { std::cell::Cell::new((0, false)) };
+    /// While a draw is prepared (`State::bind`): whether every top level a
+    /// program that walks with the host's ray-tracing hardware is given was
+    /// made in this list (`crate::guide::tops`), so that it may be bound
+    /// the host's guide table.
+    static GUIDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
@@ -520,6 +525,9 @@ pub(crate) struct State {
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
+    /// The shading rate and its two combiners as the title set them last
+    /// ([`crate::shading`]); none: never set, every pixel.
+    shading_rate: Option<[u32; 3]>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -1611,6 +1619,12 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    pub(crate) fn set_shading_rate(&mut self, list: &HostList, rate: u32, combiners: [u32; 2]) {
+        crate::shading::asked(rate, combiners);
+        self.shading_rate = Some([rate, combiners[0], combiners[1]]);
+        crate::shading::set(list, rate, combiners);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -1651,6 +1665,9 @@ impl State {
         }
         if let Some([min, max]) = self.depth_bounds {
             crate::draw::depth_bounds(list, min, max);
+        }
+        if let Some([rate, first, second]) = self.shading_rate {
+            crate::shading::set(list, rate, [first, second]);
         }
     }
 
@@ -1756,6 +1773,36 @@ impl State {
         }
     }
 
+    /// For a program that walks with the host's ray-tracing hardware for a
+    /// guide (its translation asks for the guide table): the host's top
+    /// levels of the structures whose addresses it takes are made in `list`
+    /// ([`crate::guide::tops`]). The first answer: the list's compute
+    /// bindings were replaced. The second: every one of them was made in
+    /// this list (a program whose top levels the layer does not know, or
+    /// could not all make here, is bound the table of no top level).
+    fn guide_tops(&self, list: &HostList, p: &HostPipeline) -> (bool, bool) {
+        let mut addresses: Few<u64, 4> = Few::default();
+        for stage in &p.stages {
+            let t = stage.translated();
+            if !t.host.root_srvs.contains(&victory_shader::emit::SLOT_GUIDE) {
+                continue;
+            }
+            for u in &t.host.user_data {
+                if u.root == RootType::Other(victory_shader::emit::USER_VIEW_ADDRESS) && addresses.len() < 4 {
+                    addresses.push(self.view_address(true, u.slot, u.dword));
+                }
+            }
+        }
+        if addresses.is_empty() {
+            return (false, false);
+        }
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host(),
+        };
+        heap.map_or((false, false), |heap| crate::memory::guide_tops(list, heap, &addresses))
+    }
+
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages made ready of the root views the list has set and of
@@ -1835,6 +1882,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        self.livery_probe(p);
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1913,6 +1961,9 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        if !compute {
+            crate::shading::drawn(self.shading_rate);
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1970,6 +2021,20 @@ impl State {
             self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
+        // The host's own top levels of the title's that a walking program
+        // is about to be given (`VICTORY_RAY_GUIDE=2` and up): made here,
+        // with the list's heaps set and before the program's own bindings,
+        // which the pass's replace.
+        let mut guided = false;
+        if compute && crate::guide::level() >= 2 {
+            let (recorded, all) = self.guide_tops(list, p);
+            guided = all;
+            if recorded {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
+        }
+        GUIDED.set(guided);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2106,6 +2171,28 @@ impl State {
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_GUIDE {
+                        // Ours: the guide table of a program that walks
+                        // with the host's ray-tracing hardware
+                        // (`VICTORY_RAY_GUIDE`): the host's own once it
+                        // makes structures of the title's (2 and up), else
+                        // the table that guides no top level, with which
+                        // every walk is the console's own.
+                        let Some(gpu) = crate::guide::table(crate::frame::current(), GUIDED.get()) else {
+                            once!("a shader that walks with a guide and no guide table to give it: the draw is dropped");
+                            return false;
+                        };
+                        // SAFETY: an open list; the table lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
                         }
                         continue;
@@ -4465,6 +4552,54 @@ impl State {
             let r = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
             *census.1.entry(r).or_insert(0) += 1;
         }
+    }
+
+    /// The livery probe (`crate::livery`, `VICTORY_LIVERY_PROBE=0`: off): of
+    /// a draw by one of the title's vehicle paint shaders with decals, in the
+    /// frame the probe takes about every five seconds, what decides the
+    /// body colour and what the host shows of it. For any other draw: one
+    /// test of the frame's number.
+    fn livery_probe(&self, p: &HostPipeline) {
+        let frame = crate::frame::current();
+        if !crate::livery::due(frame) {
+            return;
+        }
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        if !crate::livery::reads_decals(&t.used, &t.livery) {
+            return;
+        }
+        let Some(places) = crate::livery::places(&t.used) else {
+            return;
+        };
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let view = |(slot, dwords): (u8, u32)| -> Option<View> {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(dwords) * 4)
+        };
+        // The byte offset of the draw's material record: the second root
+        // constant (the frame listing's `u14`).
+        let record = t
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Constants)
+            .and_then(|u| match self.roots_ref(false).get(usize::from(u.slot)) {
+                Some(Root::Constants(words)) => words.get(1).copied(),
+                _ => None,
+            });
+        crate::livery::probe(frame, &stage.shader.hash, heap, &places, &view, record);
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {

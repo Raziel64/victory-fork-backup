@@ -1773,6 +1773,18 @@ mod state {
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
+    /// `RSSetShadingRate(base rate, two combiners or null)`: null is both
+    /// at passthrough.
+    pub(super) extern "system" fn shading_rate(this: This, rate: u32, combiners: *const [u32; 2]) {
+        // SAFETY: the title passes two combiners or null.
+        let combiners = unsafe { combiners.as_ref() }.copied().unwrap_or([0, 0]);
+        shading_rate_set(this, rate, combiners[0], combiners[1]);
+    }
+    /// As [`shading_rate`], the combiners by value (as a list whose calls
+    /// are written down keeps them).
+    pub(super) extern "system" fn shading_rate_set(this: This, rate: u32, first: u32, second: u32) {
+        with_state(this, |list, s| s.set_shading_rate(list, rate, [first, second]));
+    }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_binding(this, |s| s.set_heaps(items(heaps, count)));
     }
@@ -1937,6 +1949,8 @@ mod state {
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
     pub(super) use super::ignored_state as depth_bounds;
+    pub(super) use super::ignored_state as shading_rate;
+    pub(super) use super::ignored_state as shading_rate_set;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -2392,7 +2406,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
-    (124, ignored_state as *const ()),            // 0x3e0 shading rate
+    (124, state::shading_rate as *const ()),      // 0x3e0 shading rate
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.

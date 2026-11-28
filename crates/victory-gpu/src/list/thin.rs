@@ -591,6 +591,7 @@ plain! {
     TOPOLOGY topology = state::topology, (v: u32);
     STENCIL_REF stencil_ref = state::stencil_ref, (v: u32);
     DEPTH_BOUNDS depth_bounds = state::depth_bounds, (min: f32, max: f32);
+    SHADING_RATE shading_rate_set = state::shading_rate_set, (rate: u32, first: u32, second: u32);
     COMPUTE_TABLE compute_table = state::compute_table, (slot: u32, handle: u64);
     GRAPHICS_TABLE graphics_table = state::graphics_table, (slot: u32, handle: u64);
     COMPUTE_CONSTANT compute_constant = state::compute_constant, (slot: u32, value: u32, offset: u32);
@@ -616,6 +617,14 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+}
+
+/// `RSSetShadingRate(base rate, two combiners or null)`: the combiners are
+/// read now and written down by value (null: both at passthrough).
+extern "system" fn shading_rate(this: This, rate: u32, combiners: *const [u32; 2]) {
+    // SAFETY: the title passes two combiners or null.
+    let combiners = unsafe { combiners.as_ref() }.copied().unwrap_or([0, 0]);
+    shading_rate_set(this, rate, combiners[0], combiners[1]);
 }
 
 const fn after(n: u64) -> u64 {
@@ -996,7 +1005,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 51] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -1043,6 +1052,7 @@ const MINE: [(usize, *const ()); 50] = [
     (83, copy_texture_region_x as *const ()),
     (84, copy_resource_x as *const ()),
     (98, dispatch_mesh_x as *const ()),
+    (124, shading_rate as *const ()),
     (127, dispatch_mesh as *const ()),
     (129, sync as *const ()),
     (130, sync as *const ()),
@@ -1057,7 +1067,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");

@@ -3201,6 +3201,22 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// For the livery probe (`crate::livery`): what the copy's CPU side
+    /// holds of the title's `len` bytes at `address` (of a copy in the
+    /// card's memory: what was last put there for the card). `None` outside
+    /// the copy, and for title memory in place, which is no copy. A refresh
+    /// of another thread may be writing there: the answer is of the moment.
+    pub(crate) fn held_at(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        let at = address.checked_sub(self.start)?;
+        if self.place.is_some() || self.data.is_null() || at.checked_add(len as u64)? > self.len {
+            return None;
+        }
+        let mut held = vec![0u8; len];
+        // SAFETY: inside the copy's mapping, which lives as long as the copy.
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(at as usize).cast_const(), held.as_mut_ptr(), len) };
+        Some(held)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -5583,6 +5599,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let place = usize::from(on_card.is_none());
     BY_ADDRESS[2 * place].fetch_add(1, Ordering::Relaxed);
     BY_ADDRESS[2 * place + 1].fetch_add(len, Ordering::Relaxed);
+    if place == 0 {
+        BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).insert(start);
+    }
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -5614,6 +5633,16 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// shaders' side in the card's own memory, how many and their bytes; then
 /// in the PC's memory, where every access of a shader crosses the bus.
 static BY_ADDRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Where the pieces of [`by_address`] made in the card's own memory start
+/// (they live as long as the process).
+static BY_ADDRESS_ON_CARD: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether the piece of [`by_address`] that starts at `start` lies in the
+/// card's own memory (else in the PC's, where shaders read it over the bus).
+pub(crate) fn by_address_on_card(start: u64) -> bool {
+    BY_ADDRESS_ON_CARD.lock().unwrap_or_else(|e| e.into_inner()).contains(&start)
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());

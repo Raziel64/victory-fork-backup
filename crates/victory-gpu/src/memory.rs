@@ -144,6 +144,12 @@ const FAULT_SOON: u64 = 4;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
+/// [`HostList::first_use`]'s keys: the list has come to title memory by
+/// address ([`ready`]); the host's ray guide has done its frame's work in
+/// it ([`Memory::guide_work`]).
+const LIST_READ: usize = usize::MAX - 0x6d;
+const LIST_GUIDED: usize = usize::MAX - 0x6e;
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -240,6 +246,8 @@ struct Memory {
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
     stats: Stats,
+    /// What the structures are like ([`crate::raycounts`]).
+    counts: crate::raycounts::Counts,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
@@ -339,6 +347,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
+            counts: Default::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
@@ -360,6 +369,16 @@ impl Memory {
         }
         // SAFETY: an entry of the directory.
         ((unsafe { self.entry(page).read() } & !MEMORY_READ_ONLY) as usize).checked_sub(1)
+    }
+
+    /// Where the first page of the structure at `address` is, for shaders.
+    fn place_of(&self, address: u64) -> crate::raycounts::Place {
+        use crate::raycounts::Place;
+        match self.copy_of(address / PAGE) {
+            None => Place::Nowhere,
+            Some(n) if self.arenas.iter().any(|arena| arena.0 == n) => Place::Arena,
+            Some(_) => Place::Buffer,
+        }
     }
 
     /// Whether `page` can be given a place: in the directory, not turned down
@@ -516,7 +535,7 @@ impl Memory {
         *self.room.get_or_insert_with(|| {
             host()
                 .and_then(|h| h.video_memory())
-                .is_none_or(|[budget, used, ..]| crate::resource::by_address_room(budget, used, ARENA))
+                .is_none_or(|[budget, used, ..]| crate::resource::by_address_room(budget, used, ARENA + crate::guide::reserve()))
         })
     }
 
@@ -608,10 +627,52 @@ impl Memory {
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
     }
 
+    /// Where the arena page `page` of title memory lies on the card: the
+    /// arena's buffer and the byte in it.
+    fn card_page(&self, page: u64) -> Option<(ID3D12Resource, u64)> {
+        let held = self.pages.get(&page)?;
+        let shadow = self.copies.get(held.copy)?;
+        Some((shadow.buffer.clone(), held.at as u64 - shadow.span().0))
+    }
+
+    /// The host's ray guide does its frame's work in `list`
+    /// ([`crate::guide::work`]), once a list: the copies back of static
+    /// structures need the arenas as every list finds them, before the list
+    /// uses them itself.
+    fn guide_work(&self, list: &HostList) {
+        if crate::guide::level() >= 2 && list.first_use(LIST_GUIDED) {
+            crate::guide::work(list, crate::frame::current(), &|page| self.card_page(page));
+        }
+    }
+
+    /// `heap`'s run of slots with a view of each numbered copy, made or
+    /// brought up to the copies there are ([`ready`] does the same): the
+    /// slot of its null view.
+    fn run(&mut self, heap: &HostHeap) -> Option<u32> {
+        let key = std::ptr::from_ref(heap) as usize;
+        let (base, made) = match self.heaps.get(&key) {
+            Some(&run) => run,
+            None => {
+                let base = heap.dynamic(COPIES + 1)?;
+                for n in 0..=COPIES {
+                    heap.null_raw_uav_at(base + n);
+                }
+                (base, 0)
+            }
+        };
+        for (n, shadow) in self.copies.iter().enumerate().skip(made as usize) {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        self.heaps.insert(key, (base, self.copies.len() as u32));
+        Some(base)
+    }
+
     /// The packed structure at `address` is gone: the pages it alone had are
     /// given back.
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
+        crate::guide::went(address);
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
@@ -790,12 +851,16 @@ impl Memory {
             let soon = known.frame + AGAIN >= self.frame;
             known.frame = self.frame;
             if known.header == header && soon {
+                crate::guide::came(address, len, header, self.frame);
                 return;
             }
             if known.header != header {
                 self.gone(address);
             }
         }
+        // (The host's ray guide copies it back once the builder has left it
+        // alone for a while: it is unpacked in place on the card.)
+        crate::guide::came(address, len, header, self.frame);
         let last = (address + len - 1) / PAGE;
         if !self.packed.contains_key(&address) {
             self.packed.insert(address, Packed { frame: self.frame, len, header });
@@ -813,6 +878,15 @@ impl Memory {
                 self.adopt(page);
             }
             self.stats.packed_bytes += len;
+            if crate::raycounts::on() {
+                // Its header, as title memory has it (the first 8 bytes
+                // were just read there; a packed structure begins on 256
+                // bytes and is 128 long at least).
+                let mut head = [0u8; crate::raycounts::HEADER];
+                crate::host::copy_mapped(head.as_mut_ptr(), address as *const u8, head.len().min(len as usize), false);
+                let place = self.place_of(address);
+                self.counts.structure(address, &head, place);
+            }
         }
         for page in page..=last {
             let from = address.max(page * PAGE) - page * PAGE;
@@ -990,6 +1064,13 @@ impl Memory {
         let Some((from, len)) = crate::upload::block(address as usize) else {
             return;
         };
+        if crate::raycounts::on() && self.counts.wants_list(self.frame) {
+            // SAFETY: as below; bytes this time.
+            let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, len) };
+            let mut counts = std::mem::take(&mut self.counts);
+            counts.list(bytes, |structure| self.place_of(structure));
+            self.counts = counts;
+        }
         // SAFETY: the block is handed out and stays mapped; the title wrote
         // it before it recorded the dispatch.
         let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
@@ -1107,6 +1188,56 @@ impl Memory {
             wanted[0]
         );
         self.stats.from = Some((now, self.frame));
+        if let Some(line) = self.counts.line() {
+            tracing::info!("{line}");
+        }
+        self.census();
+    }
+
+    /// With the report: where the arenas' pages lie. A page in an arena in
+    /// the PC's memory is read over the bus by every step of a ray that
+    /// comes to it; a free place there is the next page's.
+    fn census(&self) {
+        // The places in `copies` of the arenas on the card.
+        let on_card: std::collections::HashSet<usize> =
+            self.arenas.iter().filter(|&&(_, at)| crate::shadow::by_address_on_card(at as u64)).map(|&(n, _)| n).collect();
+        // Held and free places: on the card, in the PC's memory.
+        let mut held = [0usize; 2];
+        let mut from_faults = [0usize; 2];
+        for page in self.pages.values() {
+            let place = usize::from(!on_card.contains(&page.copy));
+            held[place] += 1;
+            from_faults[place] += usize::from(page.fault != 0);
+        }
+        let mut free = [0usize; 2];
+        for (copy, _) in &self.free {
+            free[usize::from(!on_card.contains(copy))] += 1;
+        }
+        let next = match self.free.last() {
+            None => "none",
+            Some((copy, _)) if on_card.contains(copy) => "on the card",
+            Some(_) => "in the PC's memory",
+        };
+        let room = match self.room {
+            None => "not asked this frame",
+            Some(true) => "yes",
+            Some(false) => "no",
+        };
+        tracing::info!(
+            "title memory by address, where its arenas lie: {} on the card with {} pages held ({} of them from faults) and {} places free; \
+             {} in the PC's memory (read over the bus) with {} pages held ({} from faults) and {} places free; the next page's place: {}; \
+             room on the card for another arena now: {}",
+            on_card.len(),
+            held[0],
+            from_faults[0],
+            free[0],
+            self.arenas.len() - on_card.len(),
+            held[1],
+            from_faults[1],
+            free[1],
+            next,
+            room
+        );
     }
 }
 
@@ -1194,6 +1325,60 @@ fn mark(bits: &mut [u64], page: u64) -> bool {
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
+}
+
+/// Before a program that walks with the host's ray-tracing hardware for a
+/// guide is bound in `list` (`VICTORY_RAY_GUIDE=2` and up): the host's own
+/// top levels of the title's at `addresses` are made there
+/// ([`crate::guide::tops`]), with what a walking program is bound for its
+/// looks: the directory, the walking programs' half of the fault notes, and
+/// `heap`'s run of the copies' views. The first answer: the list's compute
+/// bindings were replaced. The second: every one of the top levels was made
+/// in this list, and the program may be bound the host's guide table (else:
+/// the table of no top level).
+pub(crate) fn guide_tops(list: &HostList, heap: &HostHeap, addresses: &[u64]) -> (bool, bool) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let Some(m) = guard.as_mut() else { return (false, false) };
+    let Some(base) = m.run(heap) else { return (false, false) };
+    // A list that has not come to title memory yet: the guide's copies back
+    // and builds first, while the list has not touched the arenas.
+    if !list.used(LIST_READ) {
+        m.guide_work(list);
+    }
+    list.keep(&m.faults.0);
+    let directory = &m.directory.1;
+    crate::guide::tops(list, heap, base, directory.gpu(directory.span().0), m.faults.2, addresses, crate::frame::current())
+}
+
+/// The guide table (`victory_shader::emit::SLOT_GUIDE`) that guides no top
+/// level, for the programs that walk the title's structures with the host's
+/// ray-tracing hardware for a guide (`VICTORY_RAY_GUIDE=1`) while the host
+/// has no structures of the title's: their node test finds no top level of
+/// its table and walks as the console does. Its address on the card; made
+/// once and kept for the process.
+///
+/// The host's own structures (`victory_shader::rays`: bottom levels from the
+/// title's unpacked ones, a top level a frame from the title's instance
+/// nodes by the pass `rays::TOP_PASS`, the table that names them) are not
+/// built here yet.
+pub(crate) fn no_guide() -> Option<u64> {
+    static TABLE: std::sync::OnceLock<Option<(ID3D12Resource, u64)>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let (words, _) = victory_shader::rays::guide_table(&[], &[]);
+            let (buffer, data) = host()?.shared_buffer(4 * words.len() as u64)?;
+            crate::host::name(&buffer, || "title memory by address: the guide table of no top level".into());
+            // SAFETY: a fresh mapping of at least that many bytes.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), data.cast::<u32>(), words.len()) };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some((buffer, gpu))
+        })
+        .as_ref()
+        .map(|table| table.1)
 }
 
 /// The offset first: a shader that sees the number sees it too.
@@ -1306,6 +1491,12 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    if !builds && crate::raycounts::on() && m.counts.wants_walked(frame) {
+        for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+            let place = m.place_of(at);
+            m.counts.walked(at, place);
+        }
+    }
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -1354,6 +1545,10 @@ pub(crate) fn ready(
                 let before = held(m);
                 m.ready(at, BUILT);
                 came[1] += held(m).saturating_sub(before);
+                // (The host's ray guide builds its own of what the title
+                // builds at run time, `VICTORY_RAY_GUIDE=4`: it looks on
+                // the card whether a bottom level is there.)
+                crate::guide::built(at, frame);
             }
         }
         if packed || !named(2, at) {
@@ -1405,6 +1600,7 @@ pub(crate) fn ready(
     }
     if first_read {
         list.keep(&m.faults.0);
+        m.guide_work(list);
         #[cfg(feature = "diagnostics")]
         m.dump(list, addresses);
     }

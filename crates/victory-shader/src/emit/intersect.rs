@@ -25,10 +25,56 @@
 //!
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
+//!
+//! # The guided node test (`VICTORY_RAY_GUIDE=1`)
+//!
+//! The host's ray-tracing hardware walks only structures it built itself,
+//! and tests no single node of the title's. But the title's structures hold
+//! their triangles as plain vertices ([`crate::rays`]), so the host can
+//! build its own from them, and the title's loop does not care how it comes
+//! by a triangle node: it tests what the box test before gave it. With the
+//! switch, the box branch of the 64-bit form over title memory becomes
+//! ([`Lower::bvh_guided`]; the same on the CPU: [`crate::rays::Guided`]):
+//!
+//! ```text
+//! the root of a top level the guide table names:  TraceRayInline(the host's top level, the operands' ray); step
+//! that node under the other box kind (the mark):  the extent is at or under the candidate's distance: commit it; step
+//! another box, while a candidate waits, the root of the candidate's bottom level:  [the candidate's triangle node, -, -, -]
+//! any other box:                                  the box test above
+//! step:  Proceed(); a candidate: [its instance node, the mark, -, -]; none: [-, -, -, -]
+//! ```
+//!
+//! The title's loop takes the instance node, does its own mask test and
+//! moves the ray into the instance, and tests the bottom level's root: it
+//! is given the candidate's triangle node, tests it with the triangle test
+//! below and judges the hit with its own code (culling, alpha, commit), as
+//! without the guide. Then it pops the mark, which comes back here for the
+//! next candidate. A committed hit's distance, weights and nodes are the
+//! title's own numbers. What changes is which triangles are looked at: those
+//! the hardware finds on the ray, not those in the boxes the ray enters.
+//!
+//! Every triangle is a candidate (the query forces "not opaque"), so masks,
+//! culling and opacity stay the title's. The query commits only what the
+//! title accepted, which it learns from the extent the title passes with
+//! the mark; from then on the hardware gives nearer candidates only.
+//!
+//! Per thread: one ray query, and one dword of group-shared memory that
+//! says a candidate waits (the title's bottom-level root comes two turns
+//! after the step; a query that was never traced must not be asked).
 
 use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' say over [`super::super::ray_guide`], for their thread.
+    pub(in crate::emit) static TEST_GUIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The tests' count of node tests: a heap slot holding a raw buffer of
+    /// a dword a thread of the dispatch (along X), which every node test a
+    /// thread runs adds one to.
+    pub(in crate::emit) static TEST_TURNS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -117,6 +163,16 @@ impl<'a> Lower<'a> {
             // dwords; no program of the title asks for it.
             return Err("a ray-tracing structure that returns triangle ids");
         }
+        // With the host's hardware for a guide: the title's way to name its
+        // structures (one descriptor for all of memory, sorted boxes), in a
+        // compute program whose lanes are host threads one to one.
+        let guided = wide
+            && sort
+            && matches!(nodes, BvhNodes::Memory { .. })
+            && !self.x.native.wave64
+            && self.s.threads.is_some()
+            && self.s.mesh.is_none()
+            && super::super::ray_guide();
         let guard = self.guard(b, i)?;
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
@@ -175,6 +231,10 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        #[cfg(test)]
+        if let Some(slot) = TEST_TURNS.get() {
+            self.bvh_count(slot, guard);
+        }
         let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
         let head = self.cur;
@@ -192,7 +252,11 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = if guided {
+            self.bvh_guided(at, kind, &ray, sort)
+        } else {
+            self.bvh_boxes(at, kind, &ray, sort)
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
@@ -655,5 +719,182 @@ impl<'a> Lower<'a> {
             let f = self.s.m.select(c, hit, out[n], miss[n]);
             self.as_int(f)
         })
+    }
+
+    /// The box branch with the host's ray-tracing hardware for a guide (the
+    /// module's notes say what it does and why; [`crate::rays::Guided`] is
+    /// the same on the CPU): four result dwords. Starts in the current
+    /// block and leaves `self.cur` at the block it ends in.
+    fn bvh_guided(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+        let NodeAt::Memory { low, high, .. } = at else {
+            return self.bvh_boxes(at, kind, ray, sort);
+        };
+        let g = self.s.ray_guide();
+        let head = self.cur;
+        let (i32t, f32t, void) = (self.s.t.i32, self.s.t.f32, self.s.t.void);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (zero, one, none) = (k(self, 0), k(self, 1), k(self, bvh::NONE));
+        // Which guided top level's root node this is: its root's pointer and
+        // the heap slot of the host's structure.
+        let mut is_top = self.s.m.bool(false);
+        let (mut root, mut slot) = (zero, zero);
+        for t in g.tops {
+            let same_low = self.s.m.cmp(head, pred::EQ, low, t[0]);
+            let same_high = self.s.m.cmp(head, pred::EQ, high, t[1]);
+            let this = self.s.m.bin(head, Bin::And, same_low, same_high);
+            is_top = self.s.m.bin(head, Bin::Or, is_top, this);
+            root = self.s.m.select(head, this, t[2], root);
+            slot = self.s.m.select(head, this, t[3], slot);
+        }
+        let mut block = || self.s.m.new_block();
+        let (top, start, mark, mark_triangle, commit) = (block(), block(), block(), block(), block());
+        let (mark_other, commit_other, step, candidate, nothing) = (block(), block(), block(), block(), block());
+        let (stepped, rest, feed, give, soft, join) = (block(), block(), block(), block(), block(), block());
+        self.s.m.terminate(head, Term::CondBr(is_top, top, rest));
+
+        // The root itself starts a ray; the root under the other box kind is
+        // the mark the step below left for the title to bring back.
+        let k7 = k(self, 7);
+        let root_kind = self.s.m.bin(top, Bin::And, root, k7);
+        let starts = self.s.m.cmp(top, pred::EQ, kind, root_kind);
+        self.s.m.terminate(top, Term::CondBr(starts, start, mark));
+
+        // The host's top level: every instance, every triangle a candidate.
+        const TOP_LEVEL: u32 = 16;
+        let structure = self.s.heap_handle(start, slot, false, true, (TOP_LEVEL, 0));
+        let (no_flags, every, fzero) = (zero, k(self, 0xff), self.s.m.f32(0));
+        let [ox, oy, oz] = ray.origin;
+        let [dx, dy, dz] = ray.direction;
+        self.s.op(
+            start,
+            "rayQuery_TraceRayInline",
+            Attr::NoUnwind,
+            void,
+            179,
+            &[g.query, structure, no_flags, every, ox, oy, oz, fzero, dx, dy, dz, ray.extent],
+        );
+        self.s.m.terminate(start, Term::Br(step));
+
+        // The mark: the title has judged the candidate. An extent at or
+        // under the candidate's distance is the title's own distance of it:
+        // the hardware need not look past it any more.
+        let state = |l: &mut Self, block: usize, what: u32| {
+            l.s.op(block, "rayQuery_StateScalar.i32", Attr::ReadOnly, i32t, what, &[g.query])
+        };
+        let distance = |l: &mut Self, block: usize, what: u32| {
+            l.s.op(block, "rayQuery_StateScalar.f32", Attr::ReadOnly, f32t, what, &[g.query])
+        };
+        const CANDIDATE_TYPE: u32 = 185;
+        let kind_of = state(self, mark, CANDIDATE_TYPE);
+        let triangle = self.s.m.cmp(mark, pred::EQ, kind_of, zero);
+        self.s.m.terminate(mark, Term::CondBr(triangle, mark_triangle, mark_other));
+        let far = distance(self, mark_triangle, 199);
+        let took = self.s.m.cmp(mark_triangle, pred::OLE, ray.extent, far);
+        self.s.m.terminate(mark_triangle, Term::CondBr(took, commit, step));
+        self.s.op(commit, "rayQuery_CommitNonOpaqueTriangleHit", Attr::NoUnwind, void, 182, &[g.query]);
+        self.s.m.terminate(commit, Term::Br(step));
+        // A box primitive (an instance the host has no triangles of, walked
+        // by the title inside its box): what the title found there is the
+        // new extent.
+        let committed = distance(self, mark_other, 200);
+        let nearer = self.s.m.cmp(mark_other, pred::OLT, ray.extent, committed);
+        self.s.m.terminate(mark_other, Term::CondBr(nearer, commit_other, step));
+        self.s.op(
+            commit_other,
+            "rayQuery_CommitProceduralPrimitiveHit",
+            Attr::NoUnwind,
+            void,
+            183,
+            &[g.query, ray.extent],
+        );
+        self.s.m.terminate(commit_other, Term::Br(step));
+
+        // The step: the next candidate's instance node, and the mark.
+        let i1t = self.s.t.i1;
+        let more = self.s.op(step, "rayQuery_Proceed.i1", Attr::NoUnwind, i1t, 180, &[g.query]);
+        self.s.m.terminate(step, Term::CondBr(more, candidate, nothing));
+        let waits = self.s.m.element(candidate, g.waits, g.thread);
+        let kind_of = state(self, candidate, CANDIDATE_TYPE);
+        let triangle = self.s.m.cmp(candidate, pred::EQ, kind_of, zero);
+        let waiting = self.s.m.cast(candidate, super::Cast::ZExt, triangle, i32t);
+        self.s.m.store(candidate, waits, waiting);
+        // (The host instance's contribution: the title's instance node's
+        // number, [`crate::rays::host_instance`].)
+        let number = state(self, candidate, 214);
+        let (k3, k6) = (k(self, 3), k(self, 6));
+        let instance = self.s.m.bin(candidate, Bin::Shl, number, k3);
+        let instance = self.s.m.bin(candidate, Bin::Or, instance, k6);
+        let back = self.s.m.bin(candidate, Bin::Xor, root, one);
+        self.s.m.terminate(candidate, Term::Br(stepped));
+        let waits = self.s.m.element(nothing, g.waits, g.thread);
+        self.s.m.store(nothing, waits, zero);
+        self.s.m.terminate(nothing, Term::Br(stepped));
+        let (first, second) = (self.s.m.phi(stepped, i32t), self.s.m.phi(stepped, i32t));
+        self.s.m.set_phi(first, vec![(instance, candidate), (none, nothing)]);
+        self.s.m.set_phi(second, vec![(back, candidate), (none, nothing)]);
+        self.s.m.terminate(stepped, Term::Br(join));
+
+        // Another box. While a candidate waits and this is the root of the
+        // candidate's bottom level (the list of its triangle nodes starts
+        // with that node's key): the candidate's triangle node.
+        let waits = self.s.m.element(rest, g.waits, g.thread);
+        let waiting = self.s.m.load(rest, waits);
+        let waiting = self.s.m.cmp(rest, pred::NE, waiting, zero);
+        self.s.m.terminate(rest, Term::CondBr(waiting, feed, soft));
+        let (undef, word, align, k2) = (self.s.m.undef(i32t), self.s.m.i8(1), k(self, 4), k(self, 2));
+        let res = self.s.t.res_ret;
+        let list = state(self, feed, 202);
+        let at_key = self.s.m.bin(feed, Bin::Shl, list, k2);
+        let key = self.s.op(feed, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[g.table, at_key, undef, word, align]);
+        let key = self.s.m.extract(feed, key, 0);
+        let key = self.s.m.cast(feed, super::Cast::Bitcast, key, i32t);
+        let (k6s, k26) = (k(self, 6), k(self, 26));
+        let mine_low = self.s.m.bin(feed, Bin::LShr, low, k6s);
+        let mine_high = self.s.m.bin(feed, Bin::Shl, high, k26);
+        let mine = self.s.m.bin(feed, Bin::Or, mine_low, mine_high);
+        let here = self.s.m.cmp(feed, pred::EQ, key, mine);
+        self.s.m.terminate(feed, Term::CondBr(here, give, soft));
+        let primitive = state(self, give, 204);
+        let entry = self.s.m.bin(give, Bin::Add, list, primitive);
+        let entry = self.s.m.bin(give, Bin::Add, entry, one);
+        let entry = self.s.m.bin(give, Bin::Shl, entry, k2);
+        let leaf = self.s.op(give, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[g.table, entry, undef, word, align]);
+        let leaf = self.s.m.extract(give, leaf, 0);
+        let leaf = self.s.m.cast(give, super::Cast::Bitcast, leaf, i32t);
+        let waits = self.s.m.element(give, g.waits, g.thread);
+        self.s.m.store(give, waits, zero);
+        self.s.m.terminate(give, Term::Br(join));
+
+        // Any other box: the console's test.
+        self.cur = soft;
+        let boxes = self.bvh_boxes(at, kind, ray, sort);
+        let soft_end = self.cur;
+        self.s.m.terminate(soft_end, Term::Br(join));
+        self.cur = join;
+        let guided = [[first, second, none, none], [leaf, none, none, none]];
+        std::array::from_fn(|n| {
+            let phi = self.s.m.phi(join, i32t);
+            self.s.m.set_phi(phi, vec![(guided[0][n], stepped), (guided[1][n], give), (boxes[n], soft_end)]);
+            phi
+        })
+    }
+
+    /// For the tests ([`TEST_TURNS`]): the thread's dword of the raw buffer
+    /// at heap slot `slot` counts this node test, for a lane that runs it.
+    #[cfg(test)]
+    fn bvh_count(&mut self, slot: u32, guard: Option<V>) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let slot = self.s.m.i32(slot);
+        let counts = self.s.heap_handle(c, slot, false, false, (11 | 0x1000, 0));
+        let (zero, k2) = (self.s.m.i32(0), self.s.m.i32(2));
+        let thread = self.s.op(c, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero]);
+        let at = self.s.m.bin(c, Bin::Shl, thread, k2);
+        let one = match guard {
+            Some(g) => self.s.m.cast(c, super::Cast::ZExt, g, i32t),
+            None => self.s.m.i32(1),
+        };
+        let undef = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[counts, zero, at, undef, undef, one]);
     }
 }

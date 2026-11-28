@@ -116,6 +116,56 @@ ray-tracing programs; they are saved for the next start. Known to be wrong
 still: some vehicles' paint comes out a flat lime green, and while
 travelling fast the ray programs' pages can lag behind.
 
+**Status, 27 November 2026, night.** By default the frame rate is where the
+session above left it (about 10 to 12.6 frames a second with ray tracing
+on). The new hardware guide (below, off unless switched on) ran on a card
+for the first time; it still leaves objects out of the rays' scene, so its
+frame rate is not counted as a gain.
+What the day's work found and what is in hand:
+
+- *Slow first minutes after a start: fixed* (`crates/victory-gpu/src/pipeline/sampler_order.rs`,
+  `VICTORY_SAMPLER_ORDER=0`: as before). Since the afternoon every start had
+  the driver compiling several hundred compute pipelines again, about 8
+  minutes in which the world ran at 2 to 9 frames a second. The driver gives
+  each static sampler a place in a table in the order root signatures are
+  first made, a compiled pipeline carries the places, and the order differed
+  from start to start, so the driver's cache on disk did not answer. Now
+  every static sampler a pipeline has had is listed in a file beside the
+  pipeline library and made in that order before the first root signature
+  that holds one. Measured on a GeForce RTX 4070: compute pipelines that took
+  over a second, 406 in a start before, 211 in the one start that compiled
+  them in the kept order, 0 of 1,314 in the next; all pipelines made 34
+  seconds after that start. VIctory-NVIDIA's commit `64d4931` describes the
+  same cause, measured on another card (`pipeline/samplers.rs` there).
+- *The card's ray-tracing hardware: first session on a card* (`VICTORY_RAY_GUIDE`, off unless set;
+  `crates/victory-gpu/src/guide.rs`, `guide/core.rs`, `crates/victory-shader/src/rays.rs`). The title's
+  ray walkers are loops over its own structures. With the guide the layer builds the host's own
+  ray-tracing structures from the title's (bottom levels decoded from title memory into a pool, a top
+  level before each walk), the card's hardware finds the candidates, and the title's own triangle
+  test still decides. Start with `play --set VICTORY_RAY_GUIDE=3 --set VICTORY_MEMORY_TARGETS_MB=2688`
+  (the translator's sources changed, so shaders translate once more).
+  **It is not right yet and its frame rate is not a gain yet.** In its first session on a GeForce RTX
+  4070 it read 12.3 to 13.2 frames a second at 7,600 to 8,300 draws a frame (75 to 81 ms), against
+  10.3 (97 ms) at 7,000 to 9,000 draws in the session above, BUT about 590 of some 2,000 instances a
+  frame were left out of the host's top level, so rays missed those objects: their ray-traced light
+  and shadows were gone on screen, and rays that find less cost less. The number says nothing until
+  the picture is whole. The cause in hand: the check that a decoded structure is sound turned down
+  most bottom levels (3,598 of 4,007 in that session), and an instance of a turned-down one is left
+  out. Every static structure of the title turned out to be stored scaled and moved in a space of
+  its own, which the decoder brings back; the check's tolerance for that is the next thing to fix.
+  Leave the switch off to play.
+  One fault found on the way: the guided node test kept a word a thread in the group's shared memory
+  and nothing stored it before the first load. The software adapter zeroes that memory and every test
+  passed; on the card the first walking dispatch never came back (device hung). The program now
+  stores it where it starts.
+- *Lime-green vehicles.* Read in the title's paint programs: the green is a
+  data value (a decal layer's paint colour picked through a mask texture),
+  not a lighting fault. Which input is wrong on the PC is not known yet; a
+  test that runs the title's program and its translation side by side on the
+  same inputs is being written.
+- Every change is now tried alone, one a session, against the session above
+  at equal draw counts, and published with the measured result.
+
 **This fork's earlier work** (up to commit `9a9091d1`) stays in this
 repository's history, with its own credits in the README of that commit.
 

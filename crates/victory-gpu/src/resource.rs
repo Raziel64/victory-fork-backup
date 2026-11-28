@@ -1918,7 +1918,46 @@ fn block_fits(used: u64, kept: u64, line: u64) -> bool {
 /// over its budget again. An arena is not given back either.
 #[cfg(windows)]
 pub(crate) fn by_address_room(budget: u64, used: u64, len: u64) -> bool {
-    by_address_fits(budget, used, len, targets_to_come())
+    by_address_fits(budget, used, len, by_address_to_come())
+}
+
+/// What [`by_address_room`] leaves free for render targets still to come:
+/// [`targets_to_come`], or with `VICTORY_MEMORY_TARGETS_MB` that many MB less
+/// what the targets hold now (unset: as before, the 3,072 MB of
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB`).
+///
+/// The 3,072 MB were measured with a scene of 2560x1440. With a scene of
+/// 1920x1080 the targets held 1,687 to 1,841 MB in run 425 (4.5 minutes in
+/// the world) and 1,772 to 2,626 MB in run 423 (9 minutes from a new game), so
+/// 1,231 to 1,385 MB were kept for targets that did not come in run 425, and
+/// with them every arena after the first twelve seconds was refused: 7 of 16
+/// (448 MB) lay in the PC's memory, read over the bus by every step of a ray
+/// that comes to them, and pages from faults had no room at all (143 held at
+/// the end where run 420 held 8,192; 15 to 50 pages of the title's a frame
+/// read zeros, 1,984 at the worst). The texture blocks' gate
+/// ([`block_room`]) keeps its own, larger, number: the room given up here
+/// goes to the arenas alone.
+#[cfg(windows)]
+fn by_address_to_come() -> u64 {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_TARGETS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(mb) = mb {
+            tracing::info!(
+                mb,
+                "title memory by address: an arena goes to the card while this much room is left for render targets, less what they hold (VICTORY_MEMORY_TARGETS_MB)"
+            );
+        }
+        mb.map(|mb| mb.min(8192) << 20)
+    });
+    to_come_of(most, targets_most(), targets_now())
+}
+
+/// [`by_address_to_come`]: `asked` (the switch) or else `most`, less what the
+/// targets hold `now`.
+#[cfg(any(windows, test))]
+fn to_come_of(asked: Option<u64>, most: u64, now: u64) -> u64 {
+    asked.unwrap_or(most).saturating_sub(now)
 }
 
 #[cfg(any(windows, test))]
@@ -4997,6 +5036,29 @@ float4 lit() : SV_Target { return 1.0; }
         // With 1,141 MB of targets to come (run 423, 19:15:04): up to 8,775 MB.
         assert!(by_address_fits(budget, 8700 * MB, 64 * MB, 1141 * MB));
         assert!(!by_address_fits(budget, 8800 * MB, 64 * MB, 1141 * MB));
+    }
+
+    /// `VICTORY_MEMORY_TARGETS_MB`: the arenas' rule counts on that many MB of
+    /// render targets, the blocks' gate on its own number as before.
+    #[test]
+    fn title_memory_by_address_counts_on_its_own_number_of_targets() {
+        const MB: u64 = 1 << 20;
+        // Unset: what the blocks' gate counts on (3,072 MB less the targets).
+        assert_eq!(to_come_of(None, 3072 * MB, 1687 * MB), 1385 * MB);
+        assert_eq!(to_come_of(Some(2688 * MB), 3072 * MB, 1687 * MB), 1001 * MB);
+        // Targets past the number: nothing more is counted on.
+        assert_eq!(to_come_of(Some(2688 * MB), 3072 * MB, 2700 * MB), 0);
+        // Run 425, 20:06:50 (budget 10,048 MB, 8,320 MB in use, targets 1,687
+        // MB): the first arena that was turned down, and with 2,688 is not.
+        let budget = 10048 * MB;
+        assert!(!by_address_fits(budget, 8320 * MB, 64 * MB, to_come_of(None, 3072 * MB, 1687 * MB)));
+        assert!(by_address_fits(budget, 8320 * MB, 64 * MB, to_come_of(Some(2688 * MB), 3072 * MB, 1687 * MB)));
+        // Its end (budget 10,011 MB, 8,707 MB in use, targets 1,841 MB), had
+        // the seven arenas gone to the card (448 MB more in use): no eighth
+        // with 2,688; with 2,432 one more while 8,900 MB are in use.
+        let budget = 10011 * MB;
+        assert!(!by_address_fits(budget, 9155 * MB, 64 * MB, to_come_of(Some(2688 * MB), 3072 * MB, 1841 * MB)));
+        assert!(by_address_fits(budget, 8900 * MB, 64 * MB, to_come_of(Some(2432 * MB), 3072 * MB, 1841 * MB)));
     }
 
     #[test]

@@ -513,6 +513,20 @@ fn bury_lag() -> u64 {
     })
 }
 
+/// For memory of the host's own that lists name by address and that is used
+/// again, not dropped (the ray guide's places and rings, `crate::guide`):
+/// what [`retire`] would wait for if the memory were let go now.
+pub(crate) fn let_go_stamp() -> u64 {
+    STARTED.load(Ordering::Acquire) + crate::queue::queued()
+}
+
+/// The newest [`let_go_stamp`] whose wait is over: every submission up to
+/// it has finished, and [`bury_lag`] more (lists recorded and not yet sent
+/// may name the memory).
+pub(crate) fn let_go_done() -> u64 {
+    FINISHED.load(Ordering::Acquire).saturating_sub(bury_lag())
+}
+
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
@@ -1711,6 +1725,8 @@ fn record_plane_pass(
                 list.IASetPrimitiveTopology(
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4),
                 );
+                // The list may hold the title's coarse rate.
+                crate::shading::plain(list);
                 list.DrawInstanced(3, 1, 0, 0);
             }
             crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
@@ -4442,6 +4458,30 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// The host GPU's variable-rate shading: its tier (0: none; 1: a rate a
+    /// draw; 2: combiners with a rate a primitive and a rate image too) and
+    /// whether it has the rates over 2x2; logged once.
+    pub(crate) fn shading_rates(&self) -> (u32, bool) {
+        static RATES: OnceLock<(u32, bool)> = OnceLock::new();
+        *RATES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS6,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let tier = if ok { options.VariableShadingRateTier.0.clamp(0, 2) as u32 } else { 0 };
+            let larger = ok && options.AdditionalShadingRatesSupported.as_bool();
+            tracing::info!(tier, larger, given = crate::shading::on(), "host variable-rate shading support");
+            (tier, larger)
         })
     }
 
